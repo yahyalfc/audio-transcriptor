@@ -2,11 +2,13 @@
 
 Upload an audio file and get back a transcript with timestamps for each segment.
 
-The project is built step by step. **Status: Parts 1 and 2 are done; Part 3 (transcription) is next.**
+The project is built step by step. **Status: Parts 1, 2 and 3 are done; Part 4 (job status + merging the chunks into one transcript) is next.**
 - **Part 1:** an upload endpoint that saves the audio file to disk, creates a job, puts the job on a message queue, and lets the client poll the job's status.
 - **Part 2:** service worker 1 takes jobs from the queue, converts each file to a standardised 16 kHz mono WAV, deletes the original, cuts the WAV into chunks at the pauses, and puts every chunk on the `chunk_processing` queue.
 
-Transcription (service worker 2) and merging come in later steps.
+- **Part 3:** service worker 2 takes the chunks off `chunk_processing` in order, sends each one to the **Transcribing Blackbox** (faster-whisper + WhisperX in Docker), shifts the returned timestamps by the chunk's start time, and saves one transcript per chunk.
+
+Still to come (Part 4): the job's `transcribing` / `completed` status, and merging the chunks into one transcript that `/status` returns.
 
 ---
 
@@ -18,13 +20,15 @@ flowchart LR
 
     subgraph Mac["Your machine"]
         API["Express API<br/>(src/server.js)"]
-        Disk[("storage/uploads/<br/>storage/standardised/<br/>storage/chunks/")]
+        Disk[("storage/uploads/<br/>storage/standardised/<br/>storage/chunks/<br/>storage/transcripts/")]
         Worker1["Service worker 1<br/>(src/workers/job-processing.worker.js)"]
+        Worker2["Service worker 2<br/>(src/workers/chunk-processing.worker.js)"]
     end
 
     subgraph Docker["Docker (docker compose)"]
         Redis[("Redis<br/>job + chunk records<br/>job_processing / chunk_processing")]
         Insight["RedisInsight<br/>GUI on :5540"]
+        Blackbox["Transcribing Blackbox<br/>faster-whisper + WhisperX<br/>HTTP on :8000"]
     end
 
     Client -- "POST /jobs" --> API
@@ -36,17 +40,20 @@ flowchart LR
     Worker1 -- "ffmpeg: upload → 16 kHz mono WAV" --> Disk
     Worker1 -- "cut at pauses → chunk WAVs" --> Disk
     Worker1 -- "status + chunk records,<br/>chunk_processing entries" --> Redis
-    Redis -. "takes chunks from chunk_processing" .-> Worker2["Service worker 2<br/>(Part 3)"]
-
-    style Worker2 stroke-dasharray: 5 5
+    Redis -- "takes chunks from chunk_processing" --> Worker2
+    Worker2 -- "POST /transcribe (chunk WAV)" --> Blackbox
+    Worker2 -- "chunk transcript JSON" --> Disk
+    Worker2 -- "chunk status" --> Redis
 ```
 
-There are four running pieces:
+There are six running pieces:
 
 | Piece | What it does | How it runs |
 |---|---|---|
 | **Express API** | Receives uploads, saves files, creates jobs, answers status requests | started by `npm run dev`, port 3000 |
 | **Service worker 1** | Takes jobs from the queue, standardises the audio with ffmpeg, cuts it into chunks and queues them | started by `npm run dev`, as its own process |
+| **Service worker 2** | Takes chunks from the queue in order, sends each to the Blackbox, saves the transcript | started by `npm run dev`, as its own process |
+| **Transcribing Blackbox** | Python HTTP service: audio in, transcript JSON out (faster-whisper + WhisperX) | Docker container, port 8000 |
 | **Redis** | Stores the job and chunk records and the `job_processing` / `chunk_processing` queues | Docker container, port 6379 |
 | **RedisInsight** | Web UI for looking at what's inside Redis. Optional, just for debugging. | Docker container, http://localhost:5540 |
 
@@ -155,11 +162,13 @@ sequenceDiagram
     W->>W: updateJob: status "chunked", chunk_count, duration_sec
 ```
 
-**Finding the pauses (VAD).** ffmpeg's `silencedetect` filter lists every stretch quieter than **-30 dB** that lasts at least **0.5 s**:
+**Finding the pauses (VAD).** ffmpeg's `silencedetect` filter lists every stretch quieter than **-30 dB** that lasts at least **0.2 s**:
 ```bash
-ffmpeg -i <wav> -af silencedetect=noise=-30dB:d=0.5 -f null -    # prints silence_start / silence_end lines
+ffmpeg -i <wav> -af silencedetect=noise=-30dB:d=0.2 -f null -    # prints silence_start / silence_end lines
 ```
-It measures loudness rather than recognising speech, but in speech a quiet gap is exactly where a sentence or phrase ends.
+It measures loudness rather than recognising speech, but in speech a quiet gap always falls **between words**, so a cut there never splits a word. A sentence may still be split across two chunks; that's fine, because merging joins the chunks back together.
+
+Why 0.2 s and not 0.5 s: fast speakers barely pause. In `audio.mp3` (690 s of talking) only 22 gaps last 0.5 s, and whole minutes had none, so 4 chunks fell back to a hard cut at 60 s, which can land mid-word. At 0.2 s there are 241 gaps, a few seconds apart, so the hard cut is no longer needed for speech.
 
 **Choosing the cuts** (`planChunks` in `src/utils/chunking.js`, plain arithmetic with no files involved):
 - Each chunk aims for **30 s** (Whisper works in 30 s windows) and is **never longer than 60 s** or (except the last one) **shorter than 10 s**.
@@ -172,6 +181,7 @@ Two real examples:
 |---|---|---|
 | speech-like test (tone with 2 s pauses at 25–27, 52–54, 94–96 s) | 3 | `0–26`, `26–53`, `53–95`, `95–116`: every cut is inside a pause |
 | `mehmaan.mp3`, a song (374 s) | almost none | `0–14.8` (a pause), then 60 s fallback cuts: 7 chunks in total |
+| `audio.mp3`, fast speech (690 s) | 241 | 22 chunks of 28–33 s (the last one 59 s), every cut between two whole words, no 60 s fallback cuts. With 0.5 s it was 16 chunks, 4 of them hard cuts. |
 
 **Each chunk gets** a WAV file, a record and a queue entry:
 
@@ -183,13 +193,84 @@ Two real examples:
 
 - **`chunk_job_id = <job_id>-000`, `-001`, …** It's built from the job and the chunk's position, so if worker 1 crashes halfway and BullMQ retries, the same ids come out again. BullMQ ignores an `add` with an id it already has, and the record is simply overwritten, so a retry never creates duplicate chunks.
 - **`start_sec` travels with the chunk**, so worker 2 can turn a chunk's timestamps back into timestamps of the whole file (chunk time + `start_sec`).
-- **The status lives in the chunk record**, not in the queue entry: the same split as jobs (see section 4).
+- **The status lives in the chunk record**, not in the queue entry: the same split as jobs (see section 5).
 - **Retries skip finished work.** The worker looks at the job's status: `queued` → do everything; `standardised` → chunk only; `chunked` → nothing left to do. When the last attempt fails, `stage` says which half broke (`standardise` or `chunk`).
 - The standardised WAV is **kept** after chunking (the spec doesn't ask for it to be deleted, and it helps debugging).
 
 ---
 
-## 4. Two things in Redis: the job record and the queue
+## 4. Service worker 2: transcribe each chunk
+
+Service worker 2 (`src/workers/chunk-processing.worker.js`) is a third process, also started by `npm run dev`. It takes the chunks off `chunk_processing` and sends each one to the **Transcribing Blackbox**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Q as chunk_processing queue
+    participant W2 as Service worker 2
+    participant R as Redis (chunk record)
+    participant B as Transcribing Blackbox (:8000)
+    participant D as storage/transcripts/
+
+    Q->>W2: transcribe_chunk {chunk_job_id, job_id, chunk_path, start_sec, end_sec}
+    W2->>R: status "processing", duration_sec, started_at
+    W2->>B: POST /transcribe (the chunk WAV)
+    B-->>W2: {language, duration_sec, aligned, segments[{start, end, text, words}]} (times from 0)
+    W2->>W2: offsetTimestamps: + start_sec on every time
+    W2->>D: <job_id>/<NNN>.json
+    W2->>R: status "completed", transcript_path, language
+```
+
+1. Load the chunk record. If it's already `completed` (a retry after success), stop.
+2. Set the status to `processing` and store the chunk's length, `duration_sec = end_sec - start_sec`.
+3. Send the WAV to the Blackbox (`utils/blackbox.js`, using Node's built-in `fetch` + `FormData`, with a 5-minute timeout).
+4. **Time offset adjustment** (`utils/transcript.js`): add the chunk's `start_sec` to every segment and word time.
+5. Save the adjusted JSON as `storage/transcripts/<job_id>/<NNN>.json`, with the same number as the chunk WAV.
+6. Set the status to `completed`, plus `transcript_path` and `language`.
+
+- **Linear order:** `concurrency: 1`, and BullMQ hands out entries first in, first out, so chunks are done 000, 001, 002, … in the order worker 1 queued them. One exception: a chunk that fails waits 5–10 s before its retry, and the next chunks carry on meanwhile. That's harmless, because every saved time is already on the whole file's timeline and merging orders the chunks by `chunk_index`.
+- **Which chunks it takes:** every chunk except one that is already `completed`. New chunks arrive as `not_started`; a chunk left in `processing` by a crashed worker is picked up again by BullMQ's retry.
+- **Failures:** 3 attempts with backoff (5 s, 10 s). After the last one, the chunk is `failed` with an `error`, e.g. `Transcribing Blackbox unreachable at http://localhost:8000 (ECONNREFUSED)`.
+- **Why the offset is needed:** the Blackbox only sees one chunk, so its times always start at 0. Adding the chunk's `start_sec` puts them on the whole file's timeline:
+
+  | File | Chunk covers | Blackbox times | Saved times |
+  |---|---|---|---|
+  | `000.json` | 0 → 39.117 s | 0.211 … | 0.211 … (offset 0, unchanged) |
+  | `001.json` | 39.117 → 72.198 s | 0.291 … | 39.408 … |
+
+  This works because worker 1 cuts the chunks back to back: each chunk's `start_sec` is the sum of the lengths (`duration_sec`) of the chunks before it. Each saved file also records its `offset_sec`. Words WhisperX couldn't align keep `null` times.
+
+### The Transcribing Blackbox (`blackbox/`)
+
+A small Python service in Docker. Audio goes in, JSON comes out, and it knows nothing about jobs or Redis.
+
+| File | What it is |
+|---|---|
+| `blackbox/app.py` | FastAPI app: `GET /health`, `POST /transcribe` |
+| `blackbox/requirements.txt` | `whisperx` (brings faster-whisper and torch), `fastapi`, `uvicorn`, `python-multipart` |
+| `blackbox/Dockerfile` | `python:3.11-slim` + ffmpeg + CPU-only torch |
+
+For each request it:
+1. **Transcribes** with **faster-whisper** (run through WhisperX). The model is loaded once at startup and the language is detected per chunk. This gives segments with rough times.
+2. **Aligns** with **WhisperX** (a wav2vec2 model for that language), which gives accurate **word-level** times. Alignment models are loaded the first time a language comes up. If a language has none, the segments are kept as they are and `aligned` is `false`.
+
+```bash
+docker compose up -d --build blackbox            # first time: slow (large image + model download)
+curl localhost:8000/health                       # {"ok":true,"model":"small"}
+curl -F file=@storage/chunks/<job_id>/000.wav localhost:8000/transcribe
+```
+
+Settings (in `docker-compose.yml`): `WHISPER_MODEL` (`small` by default; `tiny`/`base` are faster, `medium`/`large-v3` more accurate), `COMPUTE_TYPE=int8`, `DEVICE=cpu`. The models are cached in the `hf-cache` volume.
+
+**Why an HTTP service and not a Python script per chunk?**
+- The model loads once and stays in memory. Loading it for every chunk would cost seconds each time.
+- The Node side stays simple: one `fetch`.
+- In production it becomes its own GPU deployment, scaled independently of the workers.
+- Docker keeps Python 3.11 and torch off the host machine.
+
+---
+
+## 5. Two things in Redis: the job record and the queue
 
 These are easy to mix up, so here they are side by side:
 
@@ -200,18 +281,19 @@ These are easy to mix up, so here they are side by side:
 | Purpose | Remembers the job's **status** for the client | **Delivers work** to a worker |
 | Contents | `job_id, status, file_path, original_name, created_at, updated_at`, plus `started_at`, `duration_sec`, `chunk_count` from worker 1 and `stage, error` on failure | `{job_id, file_path}` |
 | Read by | `GET /jobs/:job_id/status` | Service worker 1 |
-
-The same split applies to chunks: the **chunk record** `chunk:<chunk_job_id>` holds the chunk's status (`not_started`), and the **queue entry** `bull:chunk_processing:<chunk_job_id>` delivers it to service worker 2.
 | Lifetime | Stays after the job finishes | BullMQ removes it once the job is done |
+
+The same split applies to chunks: the **chunk record** `chunk:<chunk_job_id>` holds the chunk's status, and the **queue entry** `bull:chunk_processing:<chunk_job_id>` delivers it to service worker 2.
 
 A good analogy is a restaurant:
 - The **queue** is the ticket rail in the kitchen. Tickets wait there until a cook (a worker) takes one. Once the dish is done, the ticket is thrown away.
 - The **job record** is the order on the waiter's notepad. It tracks where the order is, and it's what you check when the customer asks "is my food ready?".
 
 ### Job status lifecycle
-The upload sets `queued` (not `started`), because at that point the job is only waiting in the queue and no work has started. The workers then move the job forward: service worker 1 sets `standardised` and then `chunked` (or `failed` if it gives up). `transcribing` and `completed` come with Part 3.
+The upload sets `queued` (not `started`), because at that point the job is only waiting in the queue and no work has started. The workers then move the job forward: service worker 1 sets `standardised` and then `chunked` (or `failed` if it gives up). `transcribing` and `completed` come with Part 4.
 
-Chunks have their own, simpler status in their chunk record: they start as `not_started`, and service worker 2 will move them forward.
+Chunks have their own, simpler status in their chunk record: `not_started` (worker 1) → `processing` → `completed`, or `failed` (worker 2).
+
 Each status is in the past tense and means that step has **finished**. For example, `standardised` means the 16 kHz mono WAV already exists. While worker 1 is still converting, the status stays `queued`, but worker 1 sets `started_at` on the record when it picks the job up, so `/status` shows the job is in progress.
 
 Don't confuse the status with the queue entry's name. Every queue entry is named `process_audio`, which only describes the kind of work. The status is always read from the job record.
@@ -245,16 +327,21 @@ If the worker isn't running (e.g. you started only `npm run api`), new jobs stay
 
 ---
 
-## 5. Code map
+## 6. Code map
 
 ```
 transcription-pipeline/
-├── docker-compose.yml                Redis + RedisInsight containers
+├── docker-compose.yml                Redis, RedisInsight and Transcribing Blackbox containers
+├── blackbox/                         the Transcribing Blackbox (Python, runs in Docker)
+│   ├── app.py                        FastAPI: POST /transcribe → faster-whisper + WhisperX → JSON
+│   ├── requirements.txt              whisperx, fastapi, uvicorn, python-multipart
+│   └── Dockerfile                    python:3.11-slim + ffmpeg + CPU torch
 ├── package.json                      dependencies and npm scripts
 ├── storage/                          created automatically, not in git
 │   ├── uploads/                      uploaded audio files (deleted once standardised)
 │   ├── standardised/                 <job_id>.wav, 16 kHz mono, written by service worker 1
-│   └── chunks/<job_id>/              000.wav, 001.wav, ...: the chunks, written by service worker 1
+│   ├── chunks/<job_id>/              000.wav, 001.wav, ...: the chunks, written by service worker 1
+│   └── transcripts/<job_id>/         000.json, 001.json, ...: one transcript per chunk, written by service worker 2
 └── src/
     ├── server.js                     entry point: creates the Express app, mounts routes, starts listening
     ├── config.js                     settings: port, folders, max upload size, Redis URL
@@ -264,7 +351,7 @@ transcription-pipeline/
     │   └── error-handler.middleware.js   turns thrown errors into JSON error responses
     ├── services/
     │   ├── jobs.js                   job records in Redis: createJob / getJob / updateJob / deleteJob
-    │   └── chunks.js                 chunk records in Redis: createChunk / getChunk
+    │   └── chunks.js                 chunk records in Redis: createChunk / getChunk / updateChunk
     ├── redis/
     │   ├── redis.js                  Redis connections: redis (shared) and workerRedis (for workers)
     │   ├── job-queue.js              the job_processing queue (BullMQ)
@@ -272,9 +359,12 @@ transcription-pipeline/
     ├── utils/
     │   ├── upload.js                 saveAudioFile(req, res): saves the uploaded file with multer
     │   ├── ffmpeg.js                 ffmpeg/ffprobe: standardiseAudio, getDuration, detectSilences, cutChunk
-    │   └── chunking.js               planChunks(): decides where to cut (plain arithmetic)
+    │   ├── chunking.js               planChunks(): decides where to cut (plain arithmetic)
+    │   ├── blackbox.js               transcribe(chunk_path): POSTs a chunk to the Transcribing Blackbox
+    │   └── transcript.js             offsetTimestamps(): shifts a chunk's times by its start_sec (plain arithmetic)
     └── workers/
-        └── job-processing.worker.js  service worker 1: job_processing → standardised WAV → chunks → chunk_processing
+        ├── job-processing.worker.js  service worker 1: job_processing → standardised WAV → chunks → chunk_processing
+        └── chunk-processing.worker.js  service worker 2: chunk_processing → Blackbox → transcript JSON per chunk
 ```
 
 What each layer is responsible for:
@@ -285,7 +375,7 @@ What each layer is responsible for:
 | `middlewares/` | Runs around the routes; the error handler catches anything a route throws | yes |
 | `services/` | Business data: reading and writing job and chunk records | no |
 | `redis/` | Infrastructure: the Redis connections and the queues | no |
-| `utils/` | Reusable helpers: saving an uploaded file to disk, running ffmpeg, planning chunks | only `upload.js` reads the request |
+| `utils/` | Reusable helpers: saving an uploaded file to disk, running ffmpeg, planning chunks, calling the Blackbox | only `upload.js` reads the request |
 | `workers/` | Background processes: take jobs from a queue and process them, step by step | no |
 
 How the files import each other:
@@ -311,6 +401,11 @@ flowchart TD
     chunkQueue --> redis
     worker --> redis
     worker --> config
+    worker2[workers/chunk-processing.worker.js] --> chunkService
+    worker2 --> blackbox[utils/blackbox.js]
+    worker2 --> transcript[utils/transcript.js]
+    worker2 --> redis
+    blackbox -. "HTTP" .-> bb[(blackbox/app.py)]
 ```
 
 Reading the upload endpoint top to bottom tells the whole story:
@@ -327,23 +422,24 @@ jobsRouter.post('/', async (req, res) => {
 });
 ```
 
-## 6. Running it
+## 7. Running it
 
 **Requirements:** Node 20+, Docker Desktop and ffmpeg (`brew install ffmpeg`).
 
 ```bash
 npm install
-docker compose up -d     # start Redis and RedisInsight
-npm run dev              # starts the API (http://localhost:3000) AND service worker 1
+docker compose up -d     # start Redis, RedisInsight and the Transcribing Blackbox (first build is slow)
+npm run dev              # starts the API (http://localhost:3000), service worker 1 AND service worker 2
 ```
-`npm run dev` uses the `concurrently` package to start **two separate processes** with one command. Their log lines are prefixed `[api]` and `[worker]`. Both restart when you edit files, and Ctrl+C stops both.
+`npm run dev` uses the `concurrently` package to start **three separate processes** with one command. Their log lines are prefixed `[api]`, `[worker1]` and `[worker2]`. They restart when you edit files, and Ctrl+C stops all three.
 
 | Script | What it starts |
 |---|---|
-| `npm run dev` | API + worker, restarting when you edit files (what you normally use) |
+| `npm run dev` | API + both workers, restarting when you edit files (what you normally use) |
 | `npm run api` | only the API |
-| `npm run worker` | only service worker 1 (e.g. to run a second worker) |
-| `npm start` | API + worker, without restarting on edits |
+| `npm run worker:1` | only service worker 1 (e.g. to run a second one) |
+| `npm run worker:2` | only service worker 2 |
+| `npm start` | API + both workers, without restarting on edits |
 
 They're kept as separate processes on purpose: a slow ffmpeg conversion never slows down the API, and more workers can be started (even on another machine) without touching the API.
 
@@ -366,11 +462,11 @@ curl http://localhost:3000/jobs/6c00a623-.../status
 ```
 With the worker running, a 6-minute mp3 is standardised and chunked in about a second. The WAV is in `storage/standardised/<job_id>.wav` and the chunks in `storage/chunks/<job_id>/`.
 
-Settings can be changed with environment variables, e.g. `PORT=4000 MAX_UPLOAD_MB=100 npm run dev`. The chunking settings are `CHUNK_TARGET_SEC`, `CHUNK_MAX_SEC`, `CHUNK_MIN_SEC`, `SILENCE_NOISE_DB` and `SILENCE_MIN_SEC` (see `src/config.js`).
+Settings can be changed with environment variables, e.g. `PORT=4000 MAX_UPLOAD_MB=100 npm run dev`. The chunking settings are `CHUNK_TARGET_SEC`, `CHUNK_MAX_SEC`, `CHUNK_MIN_SEC`, `SILENCE_NOISE_DB` and `SILENCE_MIN_SEC`; worker 2 uses `BLACKBOX_URL` (default `http://localhost:8000`), `BLACKBOX_TIMEOUT_MS` and `TRANSCRIPTS_DIR` (see `src/config.js`).
 
 ---
 
-## 7. API reference
+## 8. API reference
 
 ### `POST /jobs`
 Send exactly one audio file as `multipart/form-data`. Any form field name works.
@@ -395,7 +491,7 @@ Every error has the same shape: `{"error": {"code": "...", "message": "..."}}`.
 
 ---
 
-## 8. Looking inside Redis
+## 9. Looking inside Redis
 
 After an upload, Redis contains:
 
@@ -405,7 +501,7 @@ After an upload, Redis contains:
 | `bull:job_processing:<job_id>` | hash | the queue entry: `name` (`process_audio`, a label for the kind of work, **not** the status), `data` (`{job_id, file_path}`), `opts` (retry settings) |
 | `bull:job_processing:wait` | list | ids of jobs waiting for a worker |
 | `bull:job_processing:active` / `:completed` / `:failed` | list / sorted sets | jobs the worker is processing / has finished / gave up on |
-| `chunk:<chunk_job_id>` | hash | a chunk record (`status: not_started`, `start_sec`, `end_sec`, `chunk_path`, …) |
+| `chunk:<chunk_job_id>` | hash | a chunk record: `status` (`not_started` → `processing` → `completed` / `failed`), `start_sec`, `end_sec`, `chunk_path`, then `duration_sec`, `started_at`, `transcript_path`, `language` (or `error`) from worker 2 |
 | `bull:chunk_processing:<chunk_job_id>` | hash | a chunk's queue entry, `name` = `transcribe_chunk` |
 | `bull:chunk_processing:wait` | list | chunk ids waiting for service worker 2 |
 | `bull:job_processing:events` | stream | history of queue events (`added`, …) |
@@ -435,7 +531,7 @@ MONITOR                                # live view of every command — upload a
 
 ---
 
-## 9. Design decisions
+## 10. Design decisions
 
 Where the code differs from the original task notes, or a choice had to be made:
 
@@ -445,11 +541,15 @@ Where the code differs from the original task notes, or a choice had to be made:
 | Statuses live in **records** (`job:*`, `chunk:*`), not inside queue entries | BullMQ deletes queue entries once they're done, but `/status` must keep working afterwards. Queue entries only *deliver* work. |
 | Queue entry names are `process_audio` / `transcribe_chunk` | BullMQ requires a name. It describes the *kind of work* and is deliberately not status-like, so it isn't confused with the status. |
 | ffmpeg is called with `child_process.spawn`, not fluent-ffmpeg | fluent-ffmpeg is deprecated; with spawn the exact command is visible. |
-| VAD = ffmpeg `silencedetect` (-30 dB, ≥ 0.5 s) | No extra dependencies. It measures loudness, which finds pauses well in speech. A neural VAD (e.g. Silero) would handle noisy audio and music better. |
+| VAD = ffmpeg `silencedetect` (-30 dB, ≥ 0.2 s) | No extra dependencies. It measures loudness, which finds the gaps between words well. 0.2 s rather than 0.5 s, because fast speech has few 0.5 s pauses and the 60 s hard cut could split a word. Splitting a *sentence* is fine, since merging joins it. A neural VAD (e.g. Silero) would handle noisy audio and music better; overlapping chunks would remove boundary effects entirely. |
 | Chunks aim for 30 s, max 60 s, with a hard cut if there's no pause | Whisper works in 30 s windows, and the max guarantees no chunk is too big. On music without pauses, a hard cut can split a word. |
 | `chunk_job_id = <job_id>-000, -001, …` | Predictable ids make retries safe: BullMQ ignores a duplicate id, so no duplicate chunks are created. |
 | Retries skip finished work (based on the job's status) | A crash halfway never redoes or loses work, and the original upload is deleted only after the WAV is recorded. |
-| API and workers are separate processes (one `npm run dev` starts both) | A slow ffmpeg run never slows the API, and workers can be scaled on their own. |
+| The Transcribing Blackbox is an HTTP service in Docker | The model loads once and serves every chunk; Node only needs `fetch`; it scales on its own (GPU) in production; Python/torch stay off the host. |
+| Blackbox: WhisperX `small` model, int8 on CPU | The dev machine is an M1 without CUDA. `small` is a reasonable speed/accuracy trade-off on CPU; it's one env var to change. |
+| Worker 2 runs with `concurrency: 1` | The spec asks for chunks in order (000, 001, …), and one CPU Blackbox can only do one chunk at a time anyway. |
+| Time offset = the chunk's `start_sec`, applied by worker 2 before saving | Chunks are cut back to back, so `start_sec` is exactly where the chunk sits in the file. Every saved transcript is already on the whole file's timeline, so merging only has to concatenate in `chunk_index` order. |
+| API and workers are separate processes (one `npm run dev` starts all) | A slow ffmpeg run never slows the API, and workers can be scaled on their own. |
 
 ### Running this at scale
 - **API and workers would be separate deployments**, usually from the same image with a different start command.
@@ -461,14 +561,15 @@ Where the code differs from the original task notes, or a choice had to be made:
 
 ---
 
-## 10. What's next
+## 11. What's next
 
 ```mermaid
 flowchart LR
     P1["✅ Part 1<br/>upload → job → queue → status"]
     P2a["✅ Service worker 1: standardise<br/>ffmpeg → 16 kHz mono WAV,<br/>delete original"]
     P2["✅ Service worker 1: chunk<br/>split at silences (VAD)<br/>→ chunk_processing queue"]
-    P3["Service worker 2<br/>sends chunks to the Transcribing Blackbox<br/>(faster-whisper), fixes timestamps"]
-    P4["Merge<br/>one transcript → status completed,<br/>/status returns text + segments"]
-    P1 --> P2a --> P2 --> P3 --> P4
+    P3["✅ Part 3: service worker 2<br/>chunks → Transcribing Blackbox<br/>(faster-whisper + WhisperX)<br/>→ one JSON per chunk"]
+    P3b["✅ Part 3: time offsets<br/>+start_sec on every timestamp"]
+    P4["Part 4: job status + merge<br/>transcribing → completed,<br/>/status returns text + segments"]
+    P1 --> P2a --> P2 --> P3 --> P3b --> P4
 ```

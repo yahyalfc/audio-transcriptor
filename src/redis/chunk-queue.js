@@ -3,8 +3,8 @@
 //
 // After service worker 1 has cut a job's audio into chunks, it adds one entry
 // here per chunk: { chunk_job_id, job_id, chunk_path, start_sec, end_sec }.
-// Service worker 2 (next part) will take them off one by one and send each chunk
-// to the Transcribing Blackbox. Until then, chunk entries wait in "waiting".
+// Service worker 2 (workers/chunk-processing.worker.js) takes them off one by one,
+// in order, and sends each chunk to the Transcribing Blackbox.
 //
 // Stored in Redis under keys that start with "bull:chunk_processing:".
 // ─────────────────────────────────────────────────────────────────────────────

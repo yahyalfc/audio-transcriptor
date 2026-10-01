@@ -1,0 +1,6 @@
+# Transcribing Blackbox dependencies (installed inside the Docker image, see Dockerfile).
+# whisperx brings faster-whisper (the transcription) and torch (the word alignment) with it.
+whisperx==3.8.6
+fastapi==0.118.0
+uvicorn==0.37.0
+python-multipart==0.0.20

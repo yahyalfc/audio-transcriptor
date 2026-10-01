@@ -7,8 +7,9 @@
 //   value: { chunk_job_id, job_id, chunk_index, chunk_path, start_sec, end_sec,
 //            status, created_at, updated_at }
 //
-// Status: "not_started" when created by service worker 1. Service worker 2
-// (next part) will move it forward as it transcribes the chunk.
+// Status: "not_started" when created by service worker 1. Service worker 2 then
+// moves it to "processing" and "completed" (or "failed") as it transcribes the chunk,
+// adding duration_sec, started_at, transcript_path and language (or error) on the way.
 // As with jobs, the status lives here and not in the queue entry, because BullMQ
 // deletes queue entries once they're done.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,4 +39,10 @@ export async function createChunk({ chunk_job_id, job_id, chunk_index, chunk_pat
 export async function getChunk(chunk_job_id) {
   const chunk = await redis.hgetall(`chunk:${chunk_job_id}`);
   return chunk.chunk_job_id ? chunk : null;
+}
+
+// Change some fields of a chunk record, e.g. updateChunk(id, { status: 'processing' }).
+// Service worker 2 uses it to move the chunk along: not_started → processing → completed | failed.
+export async function updateChunk(chunk_job_id, fields) {
+  await redis.hset(`chunk:${chunk_job_id}`, { ...fields, updated_at: new Date().toISOString() });
 }

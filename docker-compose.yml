@@ -1,5 +1,5 @@
 services:
-  # Redis holds the job_processing queue (BullMQ stores its lists/hashes here).
+  # Redis holds the job_processing and chunk_processing queues and the job/chunk records.
   redis:
     image: redis:7-alpine
     container_name: transcription-redis
@@ -26,6 +26,22 @@ services:
     depends_on:
       - redis
 
+  # Transcribing Blackbox: faster-whisper + WhisperX behind a small HTTP API (blackbox/).
+  # Service worker 2 POSTs each chunk to http://localhost:8000/transcribe.
+  # The first build is slow (torch is large), and the first start downloads the models.
+  blackbox:
+    build: ./blackbox
+    container_name: transcription-blackbox
+    ports:
+      - "8000:8000"
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-small} # tiny / base / small / medium / large-v3 (bigger = better but slower)
+      COMPUTE_TYPE: int8 #                     fastest setting on CPU
+      DEVICE: cpu #                            no CUDA on a Mac; "cuda" on a GPU server
+    volumes:
+      - hf-cache:/root/.cache # downloaded models, kept between restarts
+
 volumes:
   redis-data:
   redisinsight-data:
+  hf-cache:

@@ -4,10 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently --names api,worker --prefix-colors blue,green npm:api npm:worker",
+    "dev": "concurrently --names api,worker1,worker2 --prefix-colors blue,green,magenta npm:api npm:worker:1 npm:worker:2",
     "api": "node --watch src/server.js",
-    "worker": "node --watch src/workers/job-processing.worker.js",
-    "start": "concurrently --names api,worker \"node src/server.js\" \"node src/workers/job-processing.worker.js\""
+    "worker:1": "node --watch src/workers/job-processing.worker.js",
+    "worker:2": "node --watch src/workers/chunk-processing.worker.js",
+    "start": "concurrently --names api,worker1,worker2 \"node src/server.js\" \"node src/workers/job-processing.worker.js\" \"node src/workers/chunk-processing.worker.js\""
   },
   "dependencies": {
     "bullmq": "^6.3.11",

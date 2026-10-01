@@ -3,7 +3,7 @@
 //
 // Each setting has a default and can be overridden with an environment variable,
 // e.g. `PORT=4000 MAX_UPLOAD_MB=100 npm run dev`.
-// Imported by: server.js, utils/upload.js, redis/redis.js, workers/job-processing.worker.js
+// Imported by: server.js, utils/upload.js, redis/redis.js, workers/*.worker.js, utils/blackbox.js
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const config = {
@@ -26,9 +26,20 @@ export const config = {
   chunkMinSec: Number(process.env.CHUNK_MIN_SEC) || 10, //        and (except the last) not shorter than 10 s.
 
   // What counts as a pause (see detectSilences in utils/ffmpeg.js):
-  // quieter than -30 dB for at least 0.5 s.
+  // quieter than -30 dB for at least 0.2 s. Short on purpose: fast speakers barely pause
+  // between sentences (often 0.2–0.5 s), but even a 0.2 s gap falls between two words,
+  // so cutting there never splits a word. With 0.5 s, fast speech had no "pauses" at all
+  // and the planner fell back to hard cuts at 60 s, which can land mid-word.
   silenceNoiseDb: Number(process.env.SILENCE_NOISE_DB) || -30,
-  silenceMinSec: Number(process.env.SILENCE_MIN_SEC) || 0.5,
+  silenceMinSec: Number(process.env.SILENCE_MIN_SEC) || 0.2,
+
+  // Folder where service worker 2 saves each chunk's transcript: storage/transcripts/<job_id>/000.json, ...
+  transcriptsDir: process.env.TRANSCRIPTS_DIR || 'storage/transcripts',
+
+  // Address of the Transcribing Blackbox (the faster-whisper/WhisperX service in Docker),
+  // and how long service worker 2 waits for one chunk before giving up (5 minutes).
+  blackboxUrl: process.env.BLACKBOX_URL || 'http://localhost:8000',
+  blackboxTimeoutMs: Number(process.env.BLACKBOX_TIMEOUT_MS) || 300000,
 
   // Largest upload we accept, in megabytes. Bigger files are rejected with 413.
   maxUploadMb: Number(process.env.MAX_UPLOAD_MB) || 500,
