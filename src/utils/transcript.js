@@ -1,6 +1,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// utils/transcript.js: the time offset adjustment for a chunk's transcript.
+// utils/transcript.js: chunk transcripts → one transcription.
 //
+//   offsetTimestamps  shifts one chunk's times onto the whole file's timeline
+//   mergeTranscripts  combines all of a job's chunks into the final transcription
+//
+// ── The time offset ──
 // The Blackbox only ever sees one chunk, so its timestamps start at 0 for every
 // chunk. To put them on the whole file's timeline, add the chunk's start_sec:
 //
@@ -31,4 +35,35 @@ export function offsetTimestamps(result, offset_sec) {
       words: segment.words.map((word) => ({ ...word, start: shift(word.start), end: shift(word.end) })),
     })),
   };
+}
+
+// ── mergeTranscripts ────────────────────────────────────────────────────────
+// Combine a job's chunk transcripts (already offset, in chunk order) into the one
+// transcription that /status returns:
+//
+//   { language, duration, text, segments: [{ id, start, end, text }] }
+//
+// - language: the language most chunks detected (each chunk detects its own)
+// - duration: the length of the whole audio in seconds
+// - segments: every chunk's segments one after the other, numbered 0, 1, 2, ...
+//             (word timings stay in the per-chunk files, to keep /status small)
+// - text:     all segment texts joined, the transcript as one readable string
+export function mergeTranscripts(transcripts, duration) {
+  const segments = transcripts
+    .flatMap((transcript) => transcript.segments)
+    .map((segment, id) => ({ id, start: segment.start, end: segment.end, text: segment.text }));
+
+  return {
+    language: mostCommon(transcripts.map((transcript) => transcript.language)),
+    duration,
+    text: segments.map((segment) => segment.text).join(' '),
+    segments,
+  };
+}
+
+// The value that appears most often in a list, e.g. ['en', 'en', 'fr'] → 'en'.
+function mostCommon(values) {
+  const counts = {};
+  for (const value of values) counts[value] = (counts[value] || 0) + 1;
+  return Object.keys(counts).reduce((best, value) => (counts[value] > counts[best] ? value : best));
 }

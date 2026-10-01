@@ -2,7 +2,7 @@
 
 Take-home assignment: uploaded audio → transcript with per-segment timestamps. It is built piece by piece, and the user checks each step before moving on. **README.md explains the architecture and should be kept up to date when it changes.** Its section 10, "Design decisions", lists every deviation from the task notes; add to it when a new one is made.
 
-**Status (2026-10-01):** Part 1 (upload → queue → /status) ✅ and Part 2 (worker 1: standardise + chunk → chunk_processing) ✅, both validated against the user's spec. Part 3 (worker 2 + Transcribing Blackbox, one offset-adjusted transcript JSON per chunk) ✅, validated against the user's spec. **Next: Part 4**: job status `transcribing` / `completed` / failing with `stage: transcribe`, merging the chunk transcripts, and `/status` returning the transcript. The user works in small steps: propose a design and confirm it before building.
+**Status (2026-10-01):** Part 1 (upload → queue → /status) ✅ and Part 2 (worker 1: standardise + chunk → chunk_processing) ✅, both validated against the user's spec. Part 3 (worker 2 + Transcribing Blackbox, one offset-adjusted transcript JSON per chunk) ✅. Part 5 (merging back: worker 2 merges → job `completed` + `transcription`; /status returns it) ✅ (2026-10-02). **The whole pipeline is built** (the user's spec has no Part 4; it's numbered 1, 2, 3, 5). Possible improvements are listed in README §11. The user works in small steps: propose a design and confirm it before building.
 
 ## Code style (user preference)
 - **Plain JavaScript (ESM), no TypeScript.** Relative imports end in `.js`.
@@ -62,16 +62,18 @@ The user often has `npm run dev` (API + worker) running on :3000. Their worker i
 - `src/services/chunks.js` also has `updateChunk(chunk_job_id, fields)` (mirrors `updateJob`).
 - `src/utils/blackbox.js`: `transcribe(chunk_path)` reads the WAV, POSTs `FormData` (field `file`) with Node's built-in `fetch` to `${BLACKBOX_URL}/transcribe` with `AbortSignal.timeout(BLACKBOX_TIMEOUT_MS)` (5 min), and throws a readable error (unreachable / timeout / non-200 with the body).
 - `src/workers/chunk-processing.worker.js`: **service worker 2**, a BullMQ Worker on `chunk_processing` with `concurrency: 1` (so chunks are done in FIFO order 000, 001, …). `transcribeChunk`:
-  1. `getChunk`; return if it's already `completed`;
-  2. `updateChunk` status `processing`, `duration_sec` (end − start), `started_at`;
+  1. `getChunk`; if it's already `completed` (a retry), go straight to step 7;
+  2. `updateChunk` status `processing`, `duration_sec` (end − start), `started_at`; and if the job is `chunked`, `updateJob` → `transcribing` (only that transition, so the status never goes backwards; worker 1 often writes `chunked` just after chunk 000 starts, so the next chunk does it);
   3. `transcribe(chunk_path)`;
   4. `offsetTimestamps(result, start_sec)` (`src/utils/transcript.js`, pure): + `start_sec` on every segment/word time, rounded to ms; null stays null; adds `offset_sec`;
   5. write `storage/transcripts/<job_id>/<NNN>.json` (times are on the whole file's timeline);
-  6. `updateChunk` status `completed`, `transcript_path`, `language`.
-  After the last attempt fails, `on('failed')` sets the chunk to `failed` + `error`. It does **not** touch the job record yet: the job status (`transcribing`, failing the job with `stage: transcribe`) comes with Part 4.
+  6. `updateChunk` status `completed`, `transcript_path`, `language`;
+  7. `finishJobIfDone(job_id)`: `getJob`; skip if it's already `completed`. If **all** `chunk_count` chunk records (predictable ids) are `completed`: read their JSONs in order → `mergeTranscripts(transcripts, duration_sec)` (`utils/transcript.js`, pure: `{language (majority), duration, text (segments joined), segments: [{id, start, end, text}]}`, no words; that was the user's choice, and the words stay in the chunk files) → `updateJob` status `completed`, `transcription` (a JSON string), `completed_at`.
+  This design is the user's: a simple "all chunks completed?" check after each chunk. I proposed a worker 1 reorder plus chunk_count on every chunk; the user rejected it as too much. Worker 1 was **not** changed. Checking "all completed" rather than "is the last index" covers retries that finish out of order.
+  After the last attempt fails, `on('failed')` sets the chunk to `failed` + `error` **and** the job to `failed`, `stage: transcribe`, `error: "<chunk_job_id>: …"`.
   Two documented nuances vs the spec wording: it skips only `completed` chunks (not "only `not_started`"), so a chunk left in `processing` by a crash is retried; and a failed chunk retries after a 5–10 s backoff while later chunks continue, so "linear" holds on the happy path. That's harmless because times are already absolute and the merge orders by `chunk_index`.
 - `blackbox/` (Python, Docker, the `blackbox` service in docker-compose on :8000): `app.py` (FastAPI) loads `whisperx.load_model(WHISPER_MODEL=small, cpu, int8)` once at startup (WhisperX runs faster-whisper). `POST /transcribe` (multipart `file`) → `load_audio` → `model.transcribe` (language detected per chunk) → `whisperx.align` with an alignment model cached per language (none for that language → `aligned: false`). Reply: `{language, duration_sec, aligned, segments: [{start, end, text, words: [{word, start, end}]}]}`, times rounded to ms, unaligned words have null times. `GET /health`. `requirements.txt` pins whisperx 3.8.6 (needs Python ≥ 3.10; the host only has 3.9, which is one reason it runs in Docker). The Dockerfile uses CPU-only torch; the models are cached in the `hf-cache` volume. Decision: an HTTP service rather than spawning Python per chunk (the model loads once, Node only needs `fetch`, it scales separately on GPU).
-- `GET /status` also returns `started_at`, `duration_sec`/`chunk_count` (converted to numbers, because Redis stores text), and `stage`/`error` when failed. Fields that are missing are left out.
+- `GET /status` also returns `started_at`, `duration_sec`/`chunk_count` (converted to numbers, because Redis stores text), `completed_at` + `transcription` (JSON.parse of the job field) once completed, and `stage`/`error` when failed. Fields that are missing are left out.
 - The status lives in the job record, never in the queue payload.
 - The queue entry's BullMQ name is `process_audio` (renamed from `standardise`, which in RedisInsight looked like a status). Job names must never look like a status value.
 - Statuses are past tense: each one means that step has *finished* (`standardised` = the WAV exists). While worker 1 is still converting, the status stays `queued`. Don't add a `started` status, because it's not in the submitted answers. Worker 1 sets `started_at` instead, to show that a job was picked up.
@@ -105,4 +107,7 @@ The user often has `npm run dev` (API + worker) running on :3000. Their worker i
    - ✅ 3b: time offset adjustment (+`start_sec` on every segment/word). Verified with audio.mp3 (690 s, 16 chunks, en, all aligned): every time falls inside its chunk's [start_sec, end_sec], chunks don't overlap, `offset_sec` = `start_sec`.
    - Fix (user decision): SILENCE_MIN_SEC 0.5 → 0.2. Fast speech (audio.mp3) had no 0.5 s pauses for minutes, so 4 chunks got 60 s hard cuts, which can split a word. At 0.2 s every cut falls between words. The planner is unchanged; the user is fine with sentences being split, since merging rejoins them. Music still gets hard cuts.
    - Known Whisper quirk: it can invent a short phrase at a chunk's start ("Thank you." at chunk 004 of audio.mp3). Not fixed yet.
-4. Part 4 (next): job status `transcribing` (worker 2), job `failed` with `stage: transcribe`, merge the chunk JSONs by `chunk_index` → `completed`; /status returns `language, duration, text, segments`
+5. ✅ Part 5, merging back (2026-10-02). Verified on db 1:
+   - audio.mp3 → `queued → chunked → transcribing → completed`, with no backwards steps; 22 chunks → 137 segments, ids 0…136 in time order, 0.211–690.207 s, en, /status ≈ 37 KB;
+   - a single-chunk clip → completed;
+   - Blackbox stopped → chunk `failed` and job `failed`/`transcribe` with the ECONNREFUSED error.

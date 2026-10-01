@@ -2,13 +2,13 @@
 
 Upload an audio file and get back a transcript with timestamps for each segment.
 
-The project is built step by step. **Status: Parts 1, 2 and 3 are done; Part 4 (job status + merging the chunks into one transcript) is next.**
+The project is built step by step. **Status: all parts are done.** Upload an audio file, poll `/status`, and once it says `completed` the response contains the full transcription.
 - **Part 1:** an upload endpoint that saves the audio file to disk, creates a job, puts the job on a message queue, and lets the client poll the job's status.
 - **Part 2:** service worker 1 takes jobs from the queue, converts each file to a standardised 16 kHz mono WAV, deletes the original, cuts the WAV into chunks at the pauses, and puts every chunk on the `chunk_processing` queue.
 
 - **Part 3:** service worker 2 takes the chunks off `chunk_processing` in order, sends each one to the **Transcribing Blackbox** (faster-whisper + WhisperX in Docker), shifts the returned timestamps by the chunk's start time, and saves one transcript per chunk.
 
-Still to come (Part 4): the job's `transcribing` / `completed` status, and merging the chunks into one transcript that `/status` returns.
+- **Part 5, merging back:** when all of a job's chunks are done, service worker 2 combines their transcripts into one, saves it in the job record's `transcription` field and sets the job to `completed`. The next `/status` poll returns it.
 
 ---
 
@@ -199,9 +199,9 @@ Two real examples:
 
 ---
 
-## 4. Service worker 2: transcribe each chunk
+## 4. Service worker 2: transcribe each chunk, then merge
 
-Service worker 2 (`src/workers/chunk-processing.worker.js`) is a third process, also started by `npm run dev`. It takes the chunks off `chunk_processing` and sends each one to the **Transcribing Blackbox**.
+Service worker 2 (`src/workers/chunk-processing.worker.js`) is a third process, also started by `npm run dev`. It takes the chunks off `chunk_processing`, sends each one to the **Transcribing Blackbox**, and once a job's chunks are all done, merges them into the job's transcription.
 
 ```mermaid
 sequenceDiagram
@@ -219,18 +219,50 @@ sequenceDiagram
     W2->>W2: offsetTimestamps: + start_sec on every time
     W2->>D: <job_id>/<NNN>.json
     W2->>R: status "completed", transcript_path, language
+    W2->>R: all of the job's chunks completed?
+    alt yes (this was the last unfinished chunk)
+        W2->>D: read 000.json … NNN.json
+        W2->>W2: mergeTranscripts → {language, duration, text, segments}
+        W2->>R: job: status "completed", transcription, completed_at
+    end
 ```
 
-1. Load the chunk record. If it's already `completed` (a retry after success), stop.
-2. Set the status to `processing` and store the chunk's length, `duration_sec = end_sec - start_sec`.
+1. Load the chunk record. If it's already `completed` (a retry after success), skip to step 7.
+2. Set the status to `processing` and store the chunk's length, `duration_sec = end_sec - start_sec`. If the job is `chunked`, set it to `transcribing`.
 3. Send the WAV to the Blackbox (`utils/blackbox.js`, using Node's built-in `fetch` + `FormData`, with a 5-minute timeout).
 4. **Time offset adjustment** (`utils/transcript.js`): add the chunk's `start_sec` to every segment and word time.
 5. Save the adjusted JSON as `storage/transcripts/<job_id>/<NNN>.json`, with the same number as the chunk WAV.
 6. Set the status to `completed`, plus `transcript_path` and `language`.
+7. **Merge check** (`finishJobIfDone`): read the job record. If the job isn't `completed` yet and **all** `chunk_count` chunk records are `completed`:
+   1. read every chunk's JSON in chunk order;
+   2. `mergeTranscripts()` (`utils/transcript.js`) combines them;
+   3. save the result in the job record's `transcription` field, with `status: completed` and `completed_at`.
+
+   If some chunks aren't done yet, nothing happens: one of them will run this check again when it finishes.
+
+**Why "are all chunks completed?" rather than "is this the last chunk?"** If chunk 002 fails once, BullMQ retries it after a 5 s backoff while chunks 003…021 carry on. Then 021 isn't the last to finish: the check after 021 says "not yet", and the check after 002 says "all done" and merges. Running the check twice is harmless, because a job that's already `completed` is skipped.
+
+**What the transcription contains** (what `/status` returns):
+```json
+{
+  "language": "en",
+  "duration": 690.26,
+  "text": "Your ability to think and focus used to be one of the most valuable skills… ",
+  "segments": [
+    { "id": 0, "start": 0.211, "end": 7.739, "text": "Your ability to think and focus used to be…" },
+    { "id": 1, "start": 8.163, "end": 21.483, "text": "Things like TikTok and short form video…" }
+  ]
+}
+```
+- `language`: the language most chunks detected (each chunk detects its own).
+- `duration`: the length of the audio in seconds.
+- `text`: the whole transcript as one string.
+- `segments`: sentence-sized pieces with times on the whole file's timeline, numbered across all chunks. Word-level timings are kept in the per-chunk files (`storage/transcripts/<job_id>/NNN.json`) to keep `/status` small: about 37 KB for the 11.5-minute `audio.mp3`.
 
 - **Linear order:** `concurrency: 1`, and BullMQ hands out entries first in, first out, so chunks are done 000, 001, 002, … in the order worker 1 queued them. One exception: a chunk that fails waits 5–10 s before its retry, and the next chunks carry on meanwhile. That's harmless, because every saved time is already on the whole file's timeline and merging orders the chunks by `chunk_index`.
 - **Which chunks it takes:** every chunk except one that is already `completed`. New chunks arrive as `not_started`; a chunk left in `processing` by a crashed worker is picked up again by BullMQ's retry.
-- **Failures:** 3 attempts with backoff (5 s, 10 s). After the last one, the chunk is `failed` with an `error`, e.g. `Transcribing Blackbox unreachable at http://localhost:8000 (ECONNREFUSED)`.
+- **Failures:** 3 attempts with backoff (5 s, 10 s). After the last one, the chunk is `failed`, and so is its job (`stage: transcribe`), because it can't be completed without that chunk. For example: `error: "<chunk_job_id>: Transcribing Blackbox unreachable at http://localhost:8000 (ECONNREFUSED)"`.
+- **About `transcribing`:** worker 2 often starts chunk 000 a moment *before* worker 1 has written `chunked` (worker 1 queues each chunk as it cuts it). Worker 2 only moves `chunked → transcribing`, so the status never goes backwards; the job simply shows `chunked` until the next chunk starts.
 - **Why the offset is needed:** the Blackbox only sees one chunk, so its times always start at 0. Adding the chunk's `start_sec` puts them on the whole file's timeline:
 
   | File | Chunk covers | Blackbox times | Saved times |
@@ -279,7 +311,7 @@ These are easy to mix up, so here they are side by side:
 | Redis key | `job:<job_id>` (a hash) | `bull:job_processing:<job_id>`, plus the `bull:job_processing:wait` list |
 | Created by | `src/services/jobs.js` | `src/redis/job-queue.js` (the BullMQ library) |
 | Purpose | Remembers the job's **status** for the client | **Delivers work** to a worker |
-| Contents | `job_id, status, file_path, original_name, created_at, updated_at`, plus `started_at`, `duration_sec`, `chunk_count` from worker 1 and `stage, error` on failure | `{job_id, file_path}` |
+| Contents | `job_id, status, file_path, original_name, created_at, updated_at`, plus `started_at`, `duration_sec`, `chunk_count` from worker 1, `transcription` and `completed_at` from worker 2, and `stage, error` on failure | `{job_id, file_path}` |
 | Read by | `GET /jobs/:job_id/status` | Service worker 1 |
 | Lifetime | Stays after the job finishes | BullMQ removes it once the job is done |
 
@@ -290,7 +322,7 @@ A good analogy is a restaurant:
 - The **job record** is the order on the waiter's notepad. It tracks where the order is, and it's what you check when the customer asks "is my food ready?".
 
 ### Job status lifecycle
-The upload sets `queued` (not `started`), because at that point the job is only waiting in the queue and no work has started. The workers then move the job forward: service worker 1 sets `standardised` and then `chunked` (or `failed` if it gives up). `transcribing` and `completed` come with Part 4.
+The upload sets `queued` (not `started`), because at that point the job is only waiting in the queue and no work has started. The workers then move the job forward: service worker 1 sets `standardised` and then `chunked` (or `failed` if it gives up). Service worker 2 then sets `transcribing` while the chunks are transcribed, and `completed` once they are merged (or `failed` if a chunk gives up).
 
 Chunks have their own, simpler status in their chunk record: `not_started` (worker 1) → `processing` → `completed`, or `failed` (worker 2).
 
@@ -304,7 +336,7 @@ stateDiagram-v2
     queued --> standardised: worker 1 converts to 16 kHz mono WAV (built)
     standardised --> chunked: worker 1 splits it into chunks (built)
     chunked --> transcribing: worker 2 sends chunks to the Transcribing Blackbox
-    transcribing --> completed: chunks merged into one transcript
+    transcribing --> completed: worker 2 merges the chunks into one transcription
     queued --> failed
     standardised --> failed
     chunked --> failed
@@ -458,9 +490,14 @@ Poll the status:
 curl http://localhost:3000/jobs/6c00a623-.../status
 ```
 ```json
-{"job_id":"6c00a623-...","status":"chunked","original_name":"song.mp3","created_at":"...","started_at":"...","updated_at":"...","duration_sec":373.97,"chunk_count":7}
+{"job_id":"6c00a623-...","status":"transcribing","original_name":"talk.mp3","created_at":"...","started_at":"...","updated_at":"...","duration_sec":690.26,"chunk_count":22}
 ```
-With the worker running, a 6-minute mp3 is standardised and chunked in about a second. The WAV is in `storage/standardised/<job_id>.wav` and the chunks in `storage/chunks/<job_id>/`.
+Keep polling until the status is `completed`:
+```json
+{"job_id":"6c00a623-...","status":"completed", ..., "completed_at":"...","duration_sec":690.26,"chunk_count":22,
+ "transcription":{"language":"en","duration":690.26,"text":"Your ability to think…","segments":[{"id":0,"start":0.211,"end":7.739,"text":"…"}, …]}}
+```
+How long it takes: standardising and chunking take about a second. Transcription on the M1 CPU (`small` model) takes about 13 s per 30 s chunk, so the 11.5-minute `audio.mp3` (22 chunks) finished in about 5 minutes. Files: the WAV is in `storage/standardised/<job_id>.wav`, the chunks are in `storage/chunks/<job_id>/`, and the per-chunk transcripts (with word timings) are in `storage/transcripts/<job_id>/`.
 
 Settings can be changed with environment variables, e.g. `PORT=4000 MAX_UPLOAD_MB=100 npm run dev`. The chunking settings are `CHUNK_TARGET_SEC`, `CHUNK_MAX_SEC`, `CHUNK_MIN_SEC`, `SILENCE_NOISE_DB` and `SILENCE_MIN_SEC`; worker 2 uses `BLACKBOX_URL` (default `http://localhost:8000`), `BLACKBOX_TIMEOUT_MS` and `TRANSCRIPTS_DIR` (see `src/config.js`).
 
@@ -484,7 +521,7 @@ Send exactly one audio file as `multipart/form-data`. Any form field name works.
 ### `GET /jobs/:job_id/status`
 | Situation | Response |
 |---|---|
-| Job exists | **200** `{job_id, status, original_name, created_at, started_at, updated_at, duration_sec, chunk_count}`. Fields appear as the job progresses: `started_at` once worker 1 picks it up, `duration_sec` and `chunk_count` once it's chunked. A `failed` job also has `stage` (`standardise` or `chunk`) and `error`. |
+| Job exists | **200** `{job_id, status, original_name, created_at, started_at, updated_at, completed_at, duration_sec, chunk_count, transcription}`. Fields appear as the job progresses: `started_at` once worker 1 picks it up, `duration_sec` and `chunk_count` once it's chunked, and `completed_at` and `transcription` (`{language, duration, text, segments}`) once it's completed. A `failed` job also has `stage` (`standardise`, `chunk` or `transcribe`) and `error`. |
 | Unknown id | **404** `JOB_NOT_FOUND` |
 
 Every error has the same shape: `{"error": {"code": "...", "message": "..."}}`.
@@ -548,6 +585,8 @@ Where the code differs from the original task notes, or a choice had to be made:
 | The Transcribing Blackbox is an HTTP service in Docker | The model loads once and serves every chunk; Node only needs `fetch`; it scales on its own (GPU) in production; Python/torch stay off the host. |
 | Blackbox: WhisperX `small` model, int8 on CPU | The dev machine is an M1 without CUDA. `small` is a reasonable speed/accuracy trade-off on CPU; it's one env var to change. |
 | Worker 2 runs with `concurrency: 1` | The spec asks for chunks in order (000, 001, …), and one CPU Blackbox can only do one chunk at a time anyway. |
+| Merge trigger: after every completed chunk, "are **all** the job's chunks completed?" | Simple and safe with retries: a chunk retried out of order still triggers the merge, and running the check twice does nothing (an already `completed` job is skipped). No extra coordination between the workers is needed. |
+| The transcription is stored in the job record (`transcription` field, a JSON string) | The spec asks for it to be saved with the job, and `/status` already reads the job record. It contains segments only (≈ 37 KB for 11.5 min); the word timings stay in the per-chunk files. |
 | Time offset = the chunk's `start_sec`, applied by worker 2 before saving | Chunks are cut back to back, so `start_sec` is exactly where the chunk sits in the file. Every saved transcript is already on the whole file's timeline, so merging only has to concatenate in `chunk_index` order. |
 | API and workers are separate processes (one `npm run dev` starts all) | A slow ffmpeg run never slows the API, and workers can be scaled on their own. |
 
@@ -561,7 +600,7 @@ Where the code differs from the original task notes, or a choice had to be made:
 
 ---
 
-## 11. What's next
+## 11. Progress and possible improvements
 
 ```mermaid
 flowchart LR
@@ -570,6 +609,12 @@ flowchart LR
     P2["✅ Service worker 1: chunk<br/>split at silences (VAD)<br/>→ chunk_processing queue"]
     P3["✅ Part 3: service worker 2<br/>chunks → Transcribing Blackbox<br/>(faster-whisper + WhisperX)<br/>→ one JSON per chunk"]
     P3b["✅ Part 3: time offsets<br/>+start_sec on every timestamp"]
-    P4["Part 4: job status + merge<br/>transcribing → completed,<br/>/status returns text + segments"]
+    P4["✅ Part 5: merging back<br/>transcribing → completed,<br/>/status returns the transcription"]
     P1 --> P2a --> P2 --> P3 --> P3b --> P4
 ```
+
+Every part of the pipeline is built. Ideas for later:
+- **Clean up files** after a job completes (the upload is already deleted; the standardised WAV, the chunks and the per-chunk JSONs are kept for debugging).
+- **Overlapping chunks**, so music or noisy audio (where silence detection finds no gaps and hard-cuts at 60 s) never loses a word at a boundary.
+- **Whisper's invented phrases** at the start of a chunk (e.g. "Thank you."): could be filtered using the alignment scores.
+- **A GPU and a larger model** (`large-v3`) for speed and accuracy, and **object storage** instead of local paths (see "Running this at scale").
