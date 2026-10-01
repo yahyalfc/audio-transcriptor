@@ -4,11 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch src/server.js",
-    "start": "node src/server.js"
+    "dev": "concurrently --names api,worker --prefix-colors blue,green npm:api npm:worker",
+    "api": "node --watch src/server.js",
+    "worker": "node --watch src/workers/job-processing.worker.js",
+    "start": "concurrently --names api,worker \"node src/server.js\" \"node src/workers/job-processing.worker.js\""
   },
   "dependencies": {
     "bullmq": "^6.3.11",
+    "concurrently": "^9.2.4",
     "express": "^5.2.1",
     "ioredis": "^6.0.0",
     "multer": "^2.4.0"

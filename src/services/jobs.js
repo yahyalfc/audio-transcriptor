@@ -7,8 +7,8 @@
 //
 // Why not keep the status in the queue? The queue only delivers work to a worker,
 // and BullMQ deletes jobs once they finish. The job record stays.
-// The workers will update its status (queued → standardised → chunked → transcribing
-// → completed / failed), and GET /jobs/:job_id/status reads it.
+// The workers update its status with updateJob (queued → standardised → chunked →
+// transcribing → completed / failed), and GET /jobs/:job_id/status reads it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { redis } from '../redis/redis.js';
@@ -38,4 +38,11 @@ export async function getJob(job_id) {
 // Remove a job record. Used to clean up when queueing the job fails.
 export async function deleteJob(job_id) {
   await redis.del(`job:${job_id}`);
+}
+
+// Change some fields of a job record, e.g. updateJob(job_id, { status: 'standardised' }).
+// Only the given fields change; updated_at is always set to now.
+// Used by the workers as the job moves through the pipeline.
+export async function updateJob(job_id, fields) {
+  await redis.hset(`job:${job_id}`, { ...fields, updated_at: new Date().toISOString() });
 }

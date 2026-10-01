@@ -81,11 +81,16 @@ jobsRouter.get('/:job_id/status', async (req, res) => {
   }
 
   // Return only the fields the client needs (file_path is internal).
+  // started_at appears once service worker 1 has picked the job up;
+  // stage and error appear only when the job has failed.
   res.json({
     job_id: job.job_id,
     status: job.status,
     original_name: job.original_name,
     created_at: job.created_at,
+    started_at: job.started_at,
     updated_at: job.updated_at,
+    stage: job.stage,
+    error: job.error,
   });
 });

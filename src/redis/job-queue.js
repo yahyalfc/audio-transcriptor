@@ -2,9 +2,9 @@
 // job-queue.js: the job_processing message queue.
 //
 // After a file is uploaded, the controller adds a job here: { job_id, file_path }.
-// Service worker 1 (next part) will take jobs off this queue one by one and process
-// them (standardise the audio, split it into chunks). Until that worker exists,
-// jobs wait in the queue in the "waiting" state.
+// Service worker 1 (workers/job-processing.worker.js) takes jobs off this queue one
+// by one and processes them (standardise the audio; chunking comes next). Jobs wait
+// in the "waiting" state until the worker is running and picks them up.
 //
 // The queue is run by the BullMQ library and stored in Redis
 // under keys that start with "bull:job_processing:".
@@ -17,7 +17,6 @@ export const jobQueue = new Queue('job_processing', {
   connection: redis,
 
   // Settings applied to every job added to this queue.
-  // They only matter once a worker processes the jobs.
   defaultJobOptions: {
     attempts: 3, // if the worker fails on a job, BullMQ retries it, up to 3 tries in total...
     backoff: { type: 'exponential', delay: 5000 }, // ...waiting 5s before the 2nd try, 10s before the 3rd
