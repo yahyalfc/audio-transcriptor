@@ -17,7 +17,7 @@ The user often has `npm run dev` running on :3000. Test on another port (`PORT=3
 ## Folder structure (chosen by the user; keep it)
 - `src/server.js`: Express app, mounts `/jobs`, JSON 404, the error handler last, listen. `src/config.js`: PORT, UPLOAD_DIR (`storage/uploads`), MAX_UPLOAD_MB (500), REDIS_URL.
 - `src/controllers/jobs.controller.js`: the endpoints, written as a linear sequence of steps (the user prefers this to middleware chains):
-  - `POST /jobs/upload-file`:
+  - `POST /jobs` (renamed from `/jobs/upload-file` to match the submitted answers):
     1. not multipart → 415;
     2. `await saveAudioFile(req, res)`; no file → 400;
     3. `createJob` (status `queued`);
@@ -39,10 +39,9 @@ The user often has `npm run dev` running on :3000. Test on another port (`PORT=3
 - queues `job_processing` / `chunk_processing`;
 - service worker 1 (standardise + chunk) / service worker 2 (transcribe);
 - Transcribing Blackbox (faster-whisper);
-- statuses `queued → standardised → chunked → transcribing → completed | failed` (failed carries `stage` + `error`);
+- statuses `queued → standardised → chunked → transcribing → completed | failed` (failed carries `stage` + `error`). The Part 1 notes say a new job's status is `'started'`; the user decided (2026-10-01) to keep `queued` to match the submitted answers. Don't change it;
 - the /status endpoint.
 
-Open point: the submitted answers say `POST /jobs`, but the code uses `POST /jobs/upload-file`.
 
 ## Roadmap
 1. ✅ Upload → job record → job_processing queue → /status

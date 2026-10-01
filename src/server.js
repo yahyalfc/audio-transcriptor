@@ -19,7 +19,7 @@ fs.mkdirSync(config.uploadDir, { recursive: true });
 const app = express();
 
 // Every /jobs/... request is handled by the jobs controller:
-//   POST /jobs/upload-file  and  GET /jobs/:job_id/status
+//   POST /jobs  and  GET /jobs/:job_id/status
 app.use('/jobs', jobsRouter);
 
 // No route matched → 404, in the same JSON error format as every other error.

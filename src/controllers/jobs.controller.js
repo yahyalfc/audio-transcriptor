@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // jobs.controller.js: the /jobs endpoints.
 //
-//   POST /jobs/upload-file      receive an audio file, create a job, reply 202 { job_id, status }
+//   POST /jobs                  receive an audio file, create a job, reply 202 { job_id, status }
 //   GET  /jobs/:job_id/status   the /status endpoint the client polls with its job_id
 //
 // The controller only coordinates the steps; the actual work lives in:
@@ -19,9 +19,9 @@ import { createJob, deleteJob, getJob } from '../services/jobs.js';
 
 export const jobsRouter = Router();
 
-// ── POST /jobs/upload-file ──────────────────────────────────────────────────
+// ── POST /jobs ──────────────────────────────────────────────────────────────
 // check the request → save the file → create the job record → queue the job → 202
-jobsRouter.post('/upload-file', async (req, res) => {
+jobsRouter.post('/', async (req, res) => {
   // 1. Only multipart/form-data is allowed (that's how browsers and curl send files).
   //    Anything else (JSON, plain text, no body) gets 415 Unsupported Media Type.
   if (!req.is('multipart/form-data')) {

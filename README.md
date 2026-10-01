@@ -30,7 +30,7 @@ flowchart LR
 
     Worker1["Service worker 1<br/>(next part)"]
 
-    Client -- "POST /jobs/upload-file" --> API
+    Client -- "POST /jobs" --> API
     Client -- "GET /jobs/:job_id/status" --> API
     API -- "save file" --> Disk
     API -- "job record + queue entry" --> Redis
@@ -64,7 +64,7 @@ sequenceDiagram
     participant Q as redis/job-queue.js
     participant R as Redis
 
-    C->>CT: POST /jobs/upload-file (multipart/form-data, 1 audio file)
+    C->>CT: POST /jobs (multipart/form-data, 1 audio file)
     CT->>CT: not multipart/form-data? → 415
     CT->>U: await saveAudioFile(req, res)
     U->>D: stream the file to disk as <uuid>.mp3
@@ -106,7 +106,7 @@ A good analogy is a restaurant:
 - The **job record** is the order on the waiter's notepad. It tracks where the order is, and it's what you check when the customer asks "is my food ready?".
 
 ### Job status lifecycle
-Part 1 only ever sets `queued`. The workers in later parts move the job forward.
+Part 1 only ever sets `queued` (not `started`), because at that point the job is only waiting in the queue and no work has started. The workers in later parts move the job forward.
 Each status is in the past tense and means that step has **finished**. For example, `standardised` means the 16 kHz mono WAV already exists. While worker 1 is still converting, the status stays `queued`; worker 1 will add a `started_at` time to the record when it picks the job up.
 
 Don't confuse the status with the queue entry's name. Every queue entry is named `process_audio`, which only describes the kind of work. The status is always read from the job record.
@@ -151,7 +151,7 @@ transcription-pipeline/
     ├── server.js                     entry point: creates the Express app, mounts routes, starts listening
     ├── config.js                     settings: port, upload folder, max upload size, Redis URL
     ├── controllers/
-    │   └── jobs.controller.js        the endpoints: POST /jobs/upload-file, GET /jobs/:job_id/status
+    │   └── jobs.controller.js        the endpoints: POST /jobs, GET /jobs/:job_id/status
     ├── middlewares/
     │   └── error-handler.middleware.js   turns thrown errors into JSON error responses
     ├── services/
@@ -192,7 +192,7 @@ flowchart TD
 Reading the upload endpoint top to bottom tells the whole story:
 
 ```js
-jobsRouter.post('/upload-file', async (req, res) => {
+jobsRouter.post('/', async (req, res) => {
   if (!req.is('multipart/form-data')) return 415;            // 1. right request type?
   const file = await saveAudioFile(req, res);                // 2. save the file (throws → 413/400/415)
   if (!file) return 400;
@@ -215,7 +215,7 @@ npm run dev              # start the API on http://localhost:3000 (restarts when
 
 Upload a file. With curl, set the type, otherwise curl sends `application/octet-stream` and the API rejects it:
 ```bash
-curl -i -F "file=@/path/to/song.mp3;type=audio/mpeg" http://localhost:3000/jobs/upload-file
+curl -i -F "file=@/path/to/song.mp3;type=audio/mpeg" http://localhost:3000/jobs
 ```
 ```
 HTTP/1.1 202 Accepted
@@ -237,7 +237,7 @@ Settings can be changed with environment variables, e.g. `PORT=4000 MAX_UPLOAD_M
 
 ## 6. API reference
 
-### `POST /jobs/upload-file`
+### `POST /jobs`
 Send exactly one audio file as `multipart/form-data`. Any form field name works.
 
 | Situation | Response |
