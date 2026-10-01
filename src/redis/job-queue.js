@@ -3,7 +3,7 @@
 //
 // After a file is uploaded, the controller adds a job here: { job_id, file_path }.
 // Service worker 1 (workers/job-processing.worker.js) takes jobs off this queue one
-// by one and processes them (standardise the audio; chunking comes next). Jobs wait
+// by one and processes them (standardise the audio, then cut it into chunks). Jobs wait
 // in the "waiting" state until the worker is running and picks them up.
 //
 // The queue is run by the BullMQ library and stored in Redis

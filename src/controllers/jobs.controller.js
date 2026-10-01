@@ -81,8 +81,9 @@ jobsRouter.get('/:job_id/status', async (req, res) => {
   }
 
   // Return only the fields the client needs (file_path is internal).
-  // started_at appears once service worker 1 has picked the job up;
-  // stage and error appear only when the job has failed.
+  // Fields appear as the job moves along (JSON leaves out the ones not set yet):
+  // started_at once service worker 1 picks the job up, duration_sec and chunk_count
+  // once it is chunked, and stage and error only when the job has failed.
   res.json({
     job_id: job.job_id,
     status: job.status,
@@ -90,6 +91,9 @@ jobsRouter.get('/:job_id/status', async (req, res) => {
     created_at: job.created_at,
     started_at: job.started_at,
     updated_at: job.updated_at,
+    // Redis stores every value as text, so turn these two back into numbers.
+    duration_sec: job.duration_sec && Number(job.duration_sec), // length of the audio in seconds
+    chunk_count: job.chunk_count && Number(job.chunk_count), //    how many chunks it was cut into
     stage: job.stage,
     error: job.error,
   });

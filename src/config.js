@@ -17,6 +17,19 @@ export const config = {
   // Folder where service worker 1 saves the standardised (16 kHz mono WAV) files.
   standardisedDir: process.env.STANDARDISED_DIR || 'storage/standardised',
 
+  // Folder where service worker 1 saves the chunks: storage/chunks/<job_id>/000.wav, 001.wav, ...
+  chunksDir: process.env.CHUNKS_DIR || 'storage/chunks',
+
+  // How the standardised audio is cut into chunks (see utils/chunking.js).
+  chunkTargetSec: Number(process.env.CHUNK_TARGET_SEC) || 30, // aim for chunks of about 30 s,
+  chunkMaxSec: Number(process.env.CHUNK_MAX_SEC) || 60, //        never longer than 60 s,
+  chunkMinSec: Number(process.env.CHUNK_MIN_SEC) || 10, //        and (except the last) not shorter than 10 s.
+
+  // What counts as a pause (see detectSilences in utils/ffmpeg.js):
+  // quieter than -30 dB for at least 0.5 s.
+  silenceNoiseDb: Number(process.env.SILENCE_NOISE_DB) || -30,
+  silenceMinSec: Number(process.env.SILENCE_MIN_SEC) || 0.5,
+
   // Largest upload we accept, in megabytes. Bigger files are rejected with 413.
   maxUploadMb: Number(process.env.MAX_UPLOAD_MB) || 500,
 
