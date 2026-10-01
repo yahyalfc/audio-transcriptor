@@ -1,0 +1,31 @@
+services:
+  # Redis holds the job_processing queue (BullMQ stores its lists/hashes here).
+  redis:
+    image: redis:7-alpine
+    container_name: transcription-redis
+    # appendonly: persist writes to disk so queued jobs survive a restart.
+    # noeviction: required by BullMQ — never silently drop queue keys when memory is full.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  # GUI for browsing the keys in Redis: http://localhost:5540 (add database host "redis", port 6379).
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: transcription-redisinsight
+    ports:
+      - "5540:5540"
+    volumes:
+      - redisinsight-data:/data
+    depends_on:
+      - redis
+
+volumes:
+  redis-data:
+  redisinsight-data:
