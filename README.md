@@ -2,13 +2,29 @@
 
 Upload an audio file and get back a transcript with timestamps for each segment.
 
-The project is built step by step. **Status: all parts are done.** Upload an audio file, poll `/status`, and once it says `completed` the response contains the full transcription.
-- **Part 1:** an upload endpoint that saves the audio file to disk, creates a job, puts the job on a message queue, and lets the client poll the job's status.
-- **Part 2:** service worker 1 takes jobs from the queue, converts each file to a standardised 16 kHz mono WAV, deletes the original, cuts the WAV into chunks at the pauses, and puts every chunk on the `chunk_processing` queue.
+**Status: complete.** Every part of the pipeline is built and tested end to end.
 
-- **Part 3:** service worker 2 takes the chunks off `chunk_processing` in order, sends each one to the **Transcribing Blackbox** (faster-whisper + WhisperX in Docker), shifts the returned timestamps by the chunk's start time, and saves one transcript per chunk.
+```bash
+docker compose up -d        # Redis, RedisInsight and the Transcribing Blackbox
+npm install && npm run dev  # the API on :3000 + service worker 1 + service worker 2
+curl -F "file=@talk.mp3;type=audio/mpeg" http://localhost:3000/jobs     # → 202 {job_id, status: "queued"}
+curl http://localhost:3000/jobs/<job_id>/status                         # poll until "completed" → transcription
+```
 
-- **Part 5, merging back:** when all of a job's chunks are done, service worker 2 combines their transcripts into one, saves it in the job record's `transcription` field and sets the job to `completed`. The next `/status` poll returns it.
+### The journey of one file
+
+| # | Who | What happens | Job status afterwards |
+|---|---|---|---|
+| 1 | API (`POST /jobs`) | saves the upload, creates the job record, queues it on `job_processing`, replies 202 with the `job_id` | `queued` |
+| 2 | Service worker 1 | ffmpeg converts it to a 16 kHz mono WAV; the original is deleted | `standardised` |
+| 3 | Service worker 1 | finds the pauses, cuts ~30 s chunks between words, creates a chunk record for each, queues each one on `chunk_processing` | `chunked` |
+| 4 | Service worker 2 | for each chunk in order: sends it to the **Transcribing Blackbox** (faster-whisper + WhisperX), shifts its timestamps by the chunk's start time, saves it | `transcribing` |
+| 5 | Service worker 2 | once all chunks are done: merges them into one transcription and saves it on the job record | `completed` |
+| 6 | API (`GET /status`) | the next poll returns `{language, duration, text, segments}` | |
+
+If any step gives up after 3 attempts, the job is `failed`, and `stage` (`standardise`, `chunk` or `transcribe`) plus `error` say what broke.
+
+How the task's parts map to this: **Part 1** = step 1 and `/status`; **Part 2** = steps 2–3; **Part 3** = step 4; **Part 4 (merging back)** = steps 5–6.
 
 ---
 
@@ -43,7 +59,7 @@ flowchart LR
     Redis -- "takes chunks from chunk_processing" --> Worker2
     Worker2 -- "POST /transcribe (chunk WAV)" --> Blackbox
     Worker2 -- "chunk transcript JSON" --> Disk
-    Worker2 -- "chunk status" --> Redis
+    Worker2 -- "chunk status; job transcribing →<br/>completed + transcription" --> Redis
 ```
 
 There are six running pieces:
@@ -52,7 +68,7 @@ There are six running pieces:
 |---|---|---|
 | **Express API** | Receives uploads, saves files, creates jobs, answers status requests | started by `npm run dev`, port 3000 |
 | **Service worker 1** | Takes jobs from the queue, standardises the audio with ffmpeg, cuts it into chunks and queues them | started by `npm run dev`, as its own process |
-| **Service worker 2** | Takes chunks from the queue in order, sends each to the Blackbox, saves the transcript | started by `npm run dev`, as its own process |
+| **Service worker 2** | Takes chunks from the queue in order, sends each to the Blackbox, saves the transcript; merges a job's chunks once they're all done | started by `npm run dev`, as its own process |
 | **Transcribing Blackbox** | Python HTTP service: audio in, transcript JSON out (faster-whisper + WhisperX) | Docker container, port 8000 |
 | **Redis** | Stores the job and chunk records and the `job_processing` / `chunk_processing` queues | Docker container, port 6379 |
 | **RedisInsight** | Web UI for looking at what's inside Redis. Optional, just for debugging. | Docker container, http://localhost:5540 |
@@ -90,6 +106,7 @@ sequenceDiagram
         S->>R: HGETALL job:<job_id>
         CT-->>C: 200 { job_id, status, ... }  (unknown id → 404)
     end
+    Note over C,CT: once status is "completed", the response<br/>also contains the transcription
 ```
 
 **If Redis is down** when the job record or the queue entry is created, the API deletes the job record and the saved file, so nothing is left half-created, and returns `503 QUEUE_UNAVAILABLE`. The client can simply try again.
@@ -208,17 +225,17 @@ sequenceDiagram
     autonumber
     participant Q as chunk_processing queue
     participant W2 as Service worker 2
-    participant R as Redis (chunk record)
+    participant R as Redis (chunk + job records)
     participant B as Transcribing Blackbox (:8000)
     participant D as storage/transcripts/
 
     Q->>W2: transcribe_chunk {chunk_job_id, job_id, chunk_path, start_sec, end_sec}
-    W2->>R: status "processing", duration_sec, started_at
+    W2->>R: chunk: status "processing", duration_sec, started_at<br/>job: "chunked" → "transcribing"
     W2->>B: POST /transcribe (the chunk WAV)
     B-->>W2: {language, duration_sec, aligned, segments[{start, end, text, words}]} (times from 0)
     W2->>W2: offsetTimestamps: + start_sec on every time
     W2->>D: <job_id>/<NNN>.json
-    W2->>R: status "completed", transcript_path, language
+    W2->>R: chunk: status "completed", transcript_path, language
     W2->>R: all of the job's chunks completed?
     alt yes (this was the last unfinished chunk)
         W2->>D: read 000.json … NNN.json
@@ -332,9 +349,9 @@ Don't confuse the status with the queue entry's name. Every queue entry is named
 
 ```mermaid
 stateDiagram-v2
-    [*] --> queued: upload accepted (Part 1)
-    queued --> standardised: worker 1 converts to 16 kHz mono WAV (built)
-    standardised --> chunked: worker 1 splits it into chunks (built)
+    [*] --> queued: API accepts the upload
+    queued --> standardised: worker 1 converts to 16 kHz mono WAV
+    standardised --> chunked: worker 1 splits it into chunks
     chunked --> transcribing: worker 2 sends chunks to the Transcribing Blackbox
     transcribing --> completed: worker 2 merges the chunks into one transcription
     queued --> failed
@@ -355,7 +372,7 @@ flowchart LR
     A -->|error, attempts left| D[delayed<br/>backoff 5s, 10s] --> W
     A -->|error, 3 attempts used| F[failed]
 ```
-If the worker isn't running (e.g. you started only `npm run api`), new jobs stay in **waiting**. They're picked up as soon as the worker starts.
+If the worker isn't running (e.g. you started only `npm run api`), new jobs stay in **waiting**. They're picked up as soon as the worker starts. The same goes for chunks waiting for service worker 2, and for the Blackbox: if it's down, chunks fail and retry, and after 3 attempts the job is `failed` (`stage: transcribe`).
 
 ---
 
@@ -376,7 +393,7 @@ transcription-pipeline/
 │   └── transcripts/<job_id>/         000.json, 001.json, ...: one transcript per chunk, written by service worker 2
 └── src/
     ├── server.js                     entry point: creates the Express app, mounts routes, starts listening
-    ├── config.js                     settings: port, folders, max upload size, Redis URL
+    ├── config.js                     settings: port, folders, chunking + pause detection, Blackbox URL, max upload size, Redis URL
     ├── controllers/
     │   └── jobs.controller.js        the endpoints: POST /jobs, GET /jobs/:job_id/status
     ├── middlewares/
@@ -393,10 +410,10 @@ transcription-pipeline/
     │   ├── ffmpeg.js                 ffmpeg/ffprobe: standardiseAudio, getDuration, detectSilences, cutChunk
     │   ├── chunking.js               planChunks(): decides where to cut (plain arithmetic)
     │   ├── blackbox.js               transcribe(chunk_path): POSTs a chunk to the Transcribing Blackbox
-    │   └── transcript.js             offsetTimestamps(): shifts a chunk's times by its start_sec (plain arithmetic)
+    │   └── transcript.js             offsetTimestamps() + mergeTranscripts(): chunk times → file times, chunks → one transcription
     └── workers/
         ├── job-processing.worker.js  service worker 1: job_processing → standardised WAV → chunks → chunk_processing
-        └── chunk-processing.worker.js  service worker 2: chunk_processing → Blackbox → transcript JSON per chunk
+        └── chunk-processing.worker.js  service worker 2: chunk_processing → Blackbox → JSON per chunk → merge → job completed
 ```
 
 What each layer is responsible for:
@@ -407,7 +424,7 @@ What each layer is responsible for:
 | `middlewares/` | Runs around the routes; the error handler catches anything a route throws | yes |
 | `services/` | Business data: reading and writing job and chunk records | no |
 | `redis/` | Infrastructure: the Redis connections and the queues | no |
-| `utils/` | Reusable helpers: saving an uploaded file to disk, running ffmpeg, planning chunks, calling the Blackbox | only `upload.js` reads the request |
+| `utils/` | Reusable helpers: saving an uploaded file to disk, running ffmpeg, planning chunks, calling the Blackbox, offsetting and merging transcripts | only `upload.js` reads the request |
 | `workers/` | Background processes: take jobs from a queue and process them, step by step | no |
 
 How the files import each other:
@@ -434,6 +451,7 @@ flowchart TD
     worker --> redis
     worker --> config
     worker2[workers/chunk-processing.worker.js] --> chunkService
+    worker2 --> service
     worker2 --> blackbox[utils/blackbox.js]
     worker2 --> transcript[utils/transcript.js]
     worker2 --> redis
@@ -534,7 +552,7 @@ After an upload, Redis contains:
 
 | Key | Type | What it is |
 |---|---|---|
-| `job:<job_id>` | hash | our job record (status lives here) |
+| `job:<job_id>` | hash | our job record: status lives here, and once completed, the `transcription` (a JSON string) |
 | `bull:job_processing:<job_id>` | hash | the queue entry: `name` (`process_audio`, a label for the kind of work, **not** the status), `data` (`{job_id, file_path}`), `opts` (retry settings) |
 | `bull:job_processing:wait` | list | ids of jobs waiting for a worker |
 | `bull:job_processing:active` / `:completed` / `:failed` | list / sorted sets | jobs the worker is processing / has finished / gave up on |
@@ -552,7 +570,8 @@ After an upload, Redis contains:
 **Option B: redis-cli (terminal)**
 ```bash
 docker compose exec redis redis-cli
-HGETALL job:<job_id>                   # the job record
+HGETALL job:<job_id>                   # the job record (including the transcription once completed)
+HGETALL chunk:<job_id>-000             # the first chunk's record
 LRANGE bull:job_processing:wait 0 -1   # job ids waiting in the queue
 HGETALL bull:job_processing:<job_id>   # the queue entry
 MONITOR                                # live view of every command — upload a file and watch
@@ -605,15 +624,17 @@ Where the code differs from the original task notes, or a choice had to be made:
 ```mermaid
 flowchart LR
     P1["✅ Part 1<br/>upload → job → queue → status"]
-    P2a["✅ Service worker 1: standardise<br/>ffmpeg → 16 kHz mono WAV,<br/>delete original"]
-    P2["✅ Service worker 1: chunk<br/>split at silences (VAD)<br/>→ chunk_processing queue"]
+    P2a["✅ Part 2: service worker 1, standardise<br/>ffmpeg → 16 kHz mono WAV,<br/>delete original"]
+    P2["✅ Part 2: service worker 1, chunk<br/>split at silences (VAD)<br/>→ chunk_processing queue"]
     P3["✅ Part 3: service worker 2<br/>chunks → Transcribing Blackbox<br/>(faster-whisper + WhisperX)<br/>→ one JSON per chunk"]
     P3b["✅ Part 3: time offsets<br/>+start_sec on every timestamp"]
-    P4["✅ Part 5: merging back<br/>transcribing → completed,<br/>/status returns the transcription"]
+    P4["✅ Part 4: merging back<br/>transcribing → completed,<br/>/status returns the transcription"]
     P1 --> P2a --> P2 --> P3 --> P3b --> P4
 ```
 
-Every part of the pipeline is built. Ideas for later:
+Every part of the pipeline is built and was tested end to end with `audio.mp3` (11.5 min of fast speech): 22 chunks, done in order, cut between whole words; 137 segments in time order; `/status` returns about 37 KB. Also tested: a single-chunk clip, a song (`mehmaan.mp3`), a fake mp3 (→ `failed`/`standardise`) and a stopped Blackbox (→ `failed`/`transcribe`).
+
+Ideas for later:
 - **Clean up files** after a job completes (the upload is already deleted; the standardised WAV, the chunks and the per-chunk JSONs are kept for debugging).
 - **Overlapping chunks**, so music or noisy audio (where silence detection finds no gaps and hard-cuts at 60 s) never loses a word at a boundary.
 - **Whisper's invented phrases** at the start of a chunk (e.g. "Thank you."): could be filtered using the alignment scores.
